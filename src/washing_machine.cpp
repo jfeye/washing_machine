@@ -24,7 +24,7 @@ CRGB ledColor;
 
 // menu variables
 enum menu_type_t { MENU_INFOSCREEN, MENU_LIST, MENU_CHOOSER, MENU_ACTION};
-enum menu_action_t {ACTION_NONE, ACTION_GO_NOW, ACTION_GO_WHENREADY};
+enum menu_action_t {ACTION_NONE, ACTION_SET_TEMP, ACTION_SET_SPEED, ACTION_SET_PROG, ACTION_GO_NOW, ACTION_GO_WHENREADY};
 
 struct menu_option_node_t{
   uint16_t value;
@@ -56,10 +56,12 @@ menu_node_t* currentMenu;
 uint8_t selectedMenu;
 
 // simulation variables
-enum machine_program_t { M_PROGRAM_COTTON, M_PROGRAM_WOOL, M_PROGRAM_SILK, M_PROGRAM_SPIN};
-enum machine_step_t { M_STEP_HEAT, M_STEP_WASH, M_STEP_SPIN};
+enum machine_program_t { M_PROGRAM_COTTON, M_PROGRAM_WOOL, M_PROGRAM_SILK, M_PROGRAM_SPIN };
+enum machine_step_t { M_STEP_IDLE, M_STEP_HEAT, M_STEP_WASH, M_STEP_SPIN };
+enum machine_state_t { STATE_STOPPED, STATE_READY, STATE_PAUSED, STATE_RUNNING };
 
-struct machine_state_t {
+struct machine_simstate_t {
+  machine_state_t state;
   machine_program_t prog;
   machine_step_t step;
   uint8_t targetTemp;
@@ -69,14 +71,18 @@ struct machine_state_t {
   uint16_t powerConsumption;
 };
 
-
+machine_simstate_t* simState;
+uint32_t timestamp;
 
 void handleSimulation();
 void handleInput();
 void drawFrame();
+void paintInfoScreen();
 void setLEDs(CRGB color);
+void initSimulationState();
 void createMenu();
 menu_node_t* newMenuEntry(menu_type_t type, const char* label);
+void executeAction(menu_action_t action);
 
 void setup() {
     digitalWrite(LED_BUILTIN, HIGH);
@@ -98,7 +104,11 @@ void setup() {
       btn_state[i] = 0;
     }
 
+    initSimulationState();
     createMenu();
+
+    analogWrite(MOTOR_PIN,0);
+    setLEDs(CRGB::Orange);
 }
 
 void loop() {
@@ -109,15 +119,40 @@ void loop() {
   handleInput();
   handleSimulation();
   drawFrame();
-  setLEDs(ledColor);
-
-  analogWrite(MOTOR_PIN, 0);
 
   delay(10);
 }
 
 void handleSimulation(){
+  if(simState->state == STATE_RUNNING){
+    analogWrite(MOTOR_PIN, 255);
+    setLEDs(CRGB::Orange);
+    if(millis()-timestamp>5000) simState->state = STATE_STOPPED;
+  }else{
+    setLEDs(CRGB::Black);
+    analogWrite(MOTOR_PIN, 0);
+  }
+}
 
+void executeAction(menu_action_t action){
+  if(action == ACTION_GO_NOW){
+      timestamp = millis();
+      simState->state = STATE_RUNNING;
+  }
+  if(action == ACTION_GO_WHENREADY)
+    Serial.println("GO WHEN READY");
+  if(action == ACTION_SET_PROG){
+    simState->prog = (machine_program_t) currentMenu->options[selectedMenu]->value;
+    Serial.println("SET PROG " + String(simState->prog));
+  }
+  if(action == ACTION_SET_TEMP){
+    simState->targetTemp = currentMenu->options[selectedMenu]->value;
+    Serial.println("SET TEMP " + String(simState->targetTemp));
+  }
+  if(action == ACTION_SET_SPEED){
+    simState->targetSpeed = currentMenu->options[selectedMenu]->value;
+    Serial.println("SET SPEED " + String(simState->targetSpeed));
+  }
 }
 
 void handleInput(){
@@ -131,7 +166,7 @@ void handleInput(){
             case BTN_BACK:
               if(currentMenu->parent != nullptr){
                 currentMenu = currentMenu->parent;
-                selectedMenu = 0;
+                selectedMenu = currentMenu->choosen;
               }
               break;
             case BTN_LEFT:
@@ -143,23 +178,22 @@ void handleInput(){
                 selectedMenu = (selectedMenu+1) % currentMenu->numElements;
               break;
             case BTN_OK:
-              uint8_t nextMenuSelected = 0;
-              if (t == MENU_INFOSCREEN)
-                currentMenu = currentMenu->children[0];
-              else if (t == MENU_LIST){
-                if(currentMenu->children[selectedMenu]->type == MENU_CHOOSER){
-                  nextMenuSelected = currentMenu->children[selectedMenu]->choosen;
+              currentMenu->choosen = selectedMenu;
+              if (t == MENU_INFOSCREEN){
+                if (simState->state == STATE_STOPPED) {
+                  currentMenu = currentMenu->children[0];
                 }
+              }else if (t == MENU_LIST){
                 currentMenu = currentMenu->children[selectedMenu];
-                selectedMenu = nextMenuSelected;
               }else if (t == MENU_CHOOSER){
-                currentMenu->choosen = selectedMenu;
+                executeAction(currentMenu->action);
                 currentMenu = currentMenu->parent;
               }else if (t == MENU_ACTION){
-                // TODO perform action
+                executeAction(currentMenu->actions[selectedMenu]->action);
+                currentMenu->choosen = 0;
                 currentMenu = homeMenu;
               }
-              selectedMenu = nextMenuSelected;
+              selectedMenu = currentMenu->choosen;
               break;
           }
       }
@@ -181,12 +215,7 @@ void drawFrame(){
   String line = "";
   switch (currentMenu->type) {
     case MENU_INFOSCREEN:
-      display.setTextSize(1);
-      display.setCursor(1,0);
-      display.println("Symcon Demo");
-      display.setTextSize(2);
-      display.setCursor(1,8);
-      display.println(String(millis()));
+        paintInfoScreen();
       break;
     case MENU_LIST:
       display.setTextSize(1);
@@ -231,6 +260,33 @@ void drawFrame(){
   display.display();
 }
 
+void paintInfoScreen(){
+  if(simState->state == STATE_STOPPED){
+    display.setTextSize(1);
+    display.setCursor(1,0);
+    display.println("Symcon Demo");
+  }else{
+    display.setTextSize(1);
+    display.setCursor(1,0);
+    display.println("Running");
+    display.setTextSize(2);
+    display.setCursor(1,8);
+    display.println(String(5000-(millis()-timestamp)));
+  }
+}
+
+void initSimulationState(){
+  simState = (machine_simstate_t*) malloc(sizeof(machine_simstate_t));
+
+  simState->state = STATE_STOPPED;
+  simState->prog = M_PROGRAM_COTTON;
+  simState->step = M_STEP_IDLE;
+  simState->targetTemp = 90;
+  simState->currentTemp = 0;
+  simState->targetSpeed = 255;
+  simState->currentSpeed = 0;
+  simState->powerConsumption = 0;
+}
 
 void createMenu(){
 
@@ -310,6 +366,7 @@ void createMenu(){
 
     progChooser->parent = configScreen;
     progChooser->numElements = 4;
+    progChooser->action = ACTION_SET_PROG;
     progChooser->options = (menu_option_node_t**) malloc(4*sizeof(menu_option_node_t*));
     progChooser->options[0] = progCotton;
     progChooser->options[1] = progWool;
@@ -318,6 +375,7 @@ void createMenu(){
 
     tempChooser->parent = configScreen;
     tempChooser->numElements = 3;
+    tempChooser->action = ACTION_SET_TEMP;
     tempChooser->options = (menu_option_node_t**) malloc(3*sizeof(menu_option_node_t*));
     tempChooser->options[0] = temp90;
     tempChooser->options[1] = temp60;
@@ -325,6 +383,7 @@ void createMenu(){
 
     speedChooser->parent = configScreen;
     speedChooser->numElements = 3;
+    speedChooser->action = ACTION_SET_SPEED;
     speedChooser->options = (menu_option_node_t**) malloc(3*sizeof(menu_option_node_t*));
     speedChooser->options[0] = speed1400;
     speedChooser->options[1] = speed900;
