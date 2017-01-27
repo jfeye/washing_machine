@@ -13,6 +13,12 @@
 #define BTN3_PIN 7
 #define MOTOR_PIN 10
 
+#define SIM_STEP_TIME 200
+#define PROG_TIME_SPIN 20000
+#define PROG_TIME_WOOL 30000
+#define PROG_TIME_COTTON 60000
+#define PROG_TIME_SILK 10000
+
 // hardware variables
 CRGB leds[NUM_LEDS];
 const uint8_t btn_pins[] = {BTN0_PIN, BTN1_PIN, BTN2_PIN, BTN3_PIN};
@@ -72,7 +78,8 @@ struct machine_simstate_t {
 };
 
 machine_simstate_t* simState;
-uint32_t timestamp;
+uint32_t lastSim = 0;
+uint32_t timestamp = 0;
 
 void handleSimulation();
 void handleInput();
@@ -124,13 +131,77 @@ void loop() {
 }
 
 void handleSimulation(){
-  if(simState->state == STATE_RUNNING){
-    analogWrite(MOTOR_PIN, 255);
-    setLEDs(CRGB::Orange);
-    if(millis()-timestamp>5000) simState->state = STATE_STOPPED;
-  }else{
-    setLEDs(CRGB::Black);
-    analogWrite(MOTOR_PIN, 0);
+  if(millis()-lastSim > SIM_STEP_TIME){
+    lastSim = millis();
+
+    simState->powerConsumption = 1;
+
+    machine_state_t state = simState->state;
+    machine_step_t step = simState->step;
+
+        // state machine (steps)
+    if(state == STATE_RUNNING){
+
+      uint16_t progTime = 0;
+      if(simState->prog == M_PROGRAM_COTTON) progTime = PROG_TIME_COTTON;
+      else if(simState->prog == M_PROGRAM_WOOL) progTime = PROG_TIME_WOOL;
+      else if(simState->prog == M_PROGRAM_SILK) progTime = PROG_TIME_SILK;
+      else if(simState->prog == M_PROGRAM_SPIN) progTime = PROG_TIME_SILK;
+
+      if (step == M_STEP_IDLE) {
+        timestamp = millis();
+        if(simState->prog == M_PROGRAM_SPIN)  simState->step = M_STEP_SPIN;
+        else                                  simState->step = M_STEP_HEAT;
+
+      } else if (step == M_STEP_HEAT) {
+        if (simState->currentTemp >= simState->targetTemp) {
+          simState->step = M_STEP_WASH;
+          timestamp = millis();
+        }
+
+      } else if (step == M_STEP_WASH) {
+        if (millis()-timestamp > progTime){
+          simState->step = M_STEP_SPIN;
+          timestamp = millis();
+        }
+
+      } else if (step == M_STEP_SPIN) {
+        if (millis()-timestamp > progTime){
+          simState->step = M_STEP_IDLE;
+          simState->state = STATE_STOPPED;
+        }
+
+      } else simState->step = M_STEP_IDLE;
+
+    } else if (state == STATE_STOPPED) {
+      simState->step = M_STEP_IDLE;
+    }
+
+    state = simState->state;
+    step = simState->step;
+
+    // temp
+    if (simState->currentTemp <= simState->targetTemp && (step == M_STEP_HEAT || step == M_STEP_WASH)) {
+      simState->currentTemp += 3;
+    }else if(simState->currentTemp > 15){
+      simState->currentTemp--;
+    }else if(simState->currentTemp < 15){
+        simState->currentTemp++;
+    }
+
+    // Motor TODO
+    if (step == M_STEP_WASH) {
+      analogWrite(MOTOR_PIN, 128);
+    }else if (step == M_STEP_SPIN) {
+      analogWrite(MOTOR_PIN, simState->targetSpeed);
+    }else{
+      analogWrite(MOTOR_PIN, 0);
+    }
+
+    // leds
+    setLEDs(CHSV((180-2*simState->currentTemp)%256,255,255));
+
+
   }
 }
 
@@ -140,18 +211,15 @@ void executeAction(menu_action_t action){
       simState->state = STATE_RUNNING;
   }
   if(action == ACTION_GO_WHENREADY)
-    Serial.println("GO WHEN READY");
+    simState->state = STATE_READY;
   if(action == ACTION_SET_PROG){
     simState->prog = (machine_program_t) currentMenu->options[selectedMenu]->value;
-    Serial.println("SET PROG " + String(simState->prog));
   }
   if(action == ACTION_SET_TEMP){
     simState->targetTemp = currentMenu->options[selectedMenu]->value;
-    Serial.println("SET TEMP " + String(simState->targetTemp));
   }
   if(action == ACTION_SET_SPEED){
     simState->targetSpeed = currentMenu->options[selectedMenu]->value;
-    Serial.println("SET SPEED " + String(simState->targetSpeed));
   }
 }
 
@@ -181,6 +249,9 @@ void handleInput(){
               currentMenu->choosen = selectedMenu;
               if (t == MENU_INFOSCREEN){
                 if (simState->state == STATE_STOPPED) {
+                  currentMenu = currentMenu->children[0];
+                }else if(simState->state == STATE_READY){
+                  simState->state = STATE_STOPPED;
                   currentMenu = currentMenu->children[0];
                 }
               }else if (t == MENU_LIST){
@@ -261,18 +332,57 @@ void drawFrame(){
 }
 
 void paintInfoScreen(){
-  if(simState->state == STATE_STOPPED){
-    display.setTextSize(1);
-    display.setCursor(1,0);
-    display.println("Symcon Demo");
-  }else{
-    display.setTextSize(1);
-    display.setCursor(1,0);
-    display.println("Running");
-    display.setTextSize(2);
-    display.setCursor(1,8);
-    display.println(String(5000-(millis()-timestamp)));
+  String top = "";
+  String center = "";
+  String bottom = "";
+
+  switch (simState->state) {
+    case STATE_RUNNING:
+      top += "running";
+      break;
+    case STATE_PAUSED:
+      top += "paused";
+      break;
+    case STATE_STOPPED:
+      top += "stopped";
+      break;
+    case STATE_READY:
+      top += "ready";
+      break;
+    default:
+      top += "undefinded";
   }
+  switch (simState->step) {
+    case M_STEP_IDLE:
+      center += "IDLE";
+      break;
+    case M_STEP_HEAT:
+      center += "HEATING";
+      break;
+    case M_STEP_WASH:
+      center += "WASHING";
+      break;
+    case M_STEP_SPIN:
+      center += "SPINNING";
+      break;
+    default:
+      center += "undef";
+  }
+
+  if(simState->state == STATE_RUNNING){
+    bottom += String(millis() - timestamp);
+  }
+
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.println(top);
+  display.setCursor(0, 8);
+  display.setTextSize(2);
+  display.println(center);
+  display.setCursor(0, 24);
+  display.setTextSize(1);
+  display.println(bottom);
+
 }
 
 void initSimulationState(){
