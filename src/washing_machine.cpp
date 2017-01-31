@@ -19,6 +19,8 @@
 #define PROG_TIME_COTTON 60000
 #define PROG_TIME_SILK 10000
 
+#define SERIAL_TIMEOUT 1000
+
 // hardware variables
 CRGB leds[NUM_LEDS];
 const uint8_t btn_pins[] = {BTN0_PIN, BTN1_PIN, BTN2_PIN, BTN3_PIN};
@@ -62,9 +64,9 @@ menu_node_t* currentMenu;
 uint8_t selectedMenu;
 
 // simulation variables
-enum machine_program_t { M_PROGRAM_COTTON, M_PROGRAM_WOOL, M_PROGRAM_SILK, M_PROGRAM_SPIN };
-enum machine_step_t { M_STEP_IDLE, M_STEP_HEAT, M_STEP_WASH, M_STEP_SPIN };
-enum machine_state_t { STATE_STOPPED, STATE_READY, STATE_PAUSED, STATE_RUNNING };
+enum machine_program_t { M_PROGRAM_COTTON = 0x01, M_PROGRAM_WOOL = 0x02, M_PROGRAM_SILK = 0x03, M_PROGRAM_SPIN = 0x04 };
+enum machine_step_t { M_STEP_IDLE = 0x01, M_STEP_HEAT = 0x02, M_STEP_WASH = 0x03, M_STEP_SPIN = 0x04 };
+enum machine_state_t { STATE_STOPPED = 0x01, STATE_READY = 0x02, STATE_PAUSED = 0x03, STATE_RUNNING = 0x04 };
 
 struct machine_simstate_t {
   machine_state_t state;
@@ -81,15 +83,39 @@ machine_simstate_t* simState;
 uint32_t lastSim = 0;
 uint32_t timestamp = 0;
 
+// communication variables
+const uint8_t SERIAL_START = 0xFF;
+enum serial_method_t { METHOD_GET = 0x01, METHOD_POST = 0x02, METHOD_RESPONSE = 0x03 };
+enum serial_code_t { S_FAIL = 0x00 , S_PROGRAM = 0x01, S_TEMP = 0x02, S_SPEED = 0x03, S_STATE = 0x04, S_STEP = 0x05, S_POWER = 0x06, S_CTEMP = 0x07 };
+
+uint8_t inBuff[5];
+uint8_t outBuff[5];
+
+
+// programm structure :
+
+// setup()
+// loop()
+
+// communication
+void handleSerial();
+void sendError(uint16_t code);
+uint8_t receiveBytes(uint8_t bytes);
+void sendMessage(uint8_t method, uint8_t code, uint16_t payload);
+// simulation
 void handleSimulation();
+void initSimulationState();
+// button input
 void handleInput();
+void executeAction(menu_action_t action);
+// output display
 void drawFrame();
 void paintInfoScreen();
 void setLEDs(CRGB color);
-void initSimulationState();
+// menu
 void createMenu();
 menu_node_t* newMenuEntry(menu_type_t type, const char* label);
-void executeAction(menu_action_t action);
+
 
 void setup() {
     digitalWrite(LED_BUILTIN, HIGH);
@@ -105,6 +131,7 @@ void setup() {
     display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
     Serial.begin(9600);
+    while (!Serial) ;
 
     ledColor = CRGB::Black;
     for (uint8_t i = 0; i < 4; i++) {
@@ -119,8 +146,9 @@ void setup() {
 }
 
 void loop() {
-  if (Serial.available()) {
-    // handle serial
+  while (Serial.available()) {
+    if(Serial.read() == SERIAL_START) handleSerial();
+    else simState->currentTemp += 10;
   }
 
   handleInput();
@@ -129,6 +157,86 @@ void loop() {
 
   delay(10);
 }
+
+// communication --------------------------------------------------------------
+
+void handleSerial(){
+  if(!receiveBytes(4)) return;
+
+  uint8_t method = inBuff[0];
+  uint8_t code = inBuff[1];
+  uint16_t payload = (inBuff[2] << 8) + inBuff[3];
+
+  switch (method) {
+    case METHOD_GET:
+      switch (code) {
+        case S_FAIL:
+          // TODO
+          break;
+        case S_PROGRAM:
+          sendMessage(METHOD_RESPONSE, S_PROGRAM, simState->prog);
+          break;
+        case S_TEMP:
+          sendMessage(METHOD_RESPONSE, S_TEMP, simState->targetTemp);
+          break;
+        case S_SPEED:
+          sendMessage(METHOD_RESPONSE, S_SPEED, simState->targetSpeed);
+          break;
+        case S_STATE:
+          sendMessage(METHOD_RESPONSE, S_STATE, simState->state);
+          break;
+        case S_STEP:
+          sendMessage(METHOD_RESPONSE, S_STEP, simState->step);
+          break;
+        case S_POWER:
+          sendMessage(METHOD_RESPONSE, S_POWER, simState->powerConsumption);
+          break;
+        case S_CTEMP:
+          sendMessage(METHOD_RESPONSE, S_CTEMP, simState->currentTemp);
+          break;
+        default:
+          // TODO some error
+          break;
+      }
+      break;
+  }
+}
+
+void sendError(uint16_t code){
+  /* codes:
+  0000 generic
+  */
+  outBuff[0] = 0xFF;
+  outBuff[1] = 0x03;
+  outBuff[2] = 0x00;
+  outBuff[3] = code >> 8;
+  outBuff[4] = code & 0xFF;
+  Serial.write(outBuff, 5);
+  Serial.flush();
+}
+
+uint8_t receiveBytes(uint8_t bytes){
+  uint32_t ts = millis();
+  while(Serial.available() < bytes && millis()-ts < SERIAL_TIMEOUT) delay(1);
+  uint8_t n = Serial.readBytes(inBuff, bytes);
+  if(n != bytes){
+    sendError(0);
+    return 0;
+  }
+  return 1;
+}
+
+void sendMessage(uint8_t method, uint8_t code, uint16_t payload){
+  outBuff[0] = SERIAL_START;
+  outBuff[1] = method;
+  outBuff[2] = code;
+  outBuff[3] = payload >> 8;
+  outBuff[4] = payload & 0xFF;
+  Serial.write(outBuff, 5);
+  Serial.flush();
+}
+
+// simulation -----------------------------------------------------------------
 
 void handleSimulation(){
   if(millis()-lastSim > SIM_STEP_TIME){
@@ -139,7 +247,7 @@ void handleSimulation(){
     machine_state_t state = simState->state;
     machine_step_t step = simState->step;
 
-        // state machine (steps)
+    // state machine (steps)
     if(state == STATE_RUNNING){
 
       uint16_t progTime = 0;
@@ -176,7 +284,6 @@ void handleSimulation(){
     } else if (state == STATE_STOPPED) {
       simState->step = M_STEP_IDLE;
     }
-
     state = simState->state;
     step = simState->step;
 
@@ -200,28 +307,23 @@ void handleSimulation(){
 
     // leds
     setLEDs(CHSV((180-2*simState->currentTemp)%256,255,255));
-
-
   }
 }
 
-void executeAction(menu_action_t action){
-  if(action == ACTION_GO_NOW){
-      timestamp = millis();
-      simState->state = STATE_RUNNING;
-  }
-  if(action == ACTION_GO_WHENREADY)
-    simState->state = STATE_READY;
-  if(action == ACTION_SET_PROG){
-    simState->prog = (machine_program_t) currentMenu->options[selectedMenu]->value;
-  }
-  if(action == ACTION_SET_TEMP){
-    simState->targetTemp = currentMenu->options[selectedMenu]->value;
-  }
-  if(action == ACTION_SET_SPEED){
-    simState->targetSpeed = currentMenu->options[selectedMenu]->value;
-  }
+void initSimulationState(){
+  simState = (machine_simstate_t*) malloc(sizeof(machine_simstate_t));
+
+  simState->state = STATE_STOPPED;
+  simState->prog = M_PROGRAM_COTTON;
+  simState->step = M_STEP_IDLE;
+  simState->targetTemp = 90;
+  simState->currentTemp = 0;
+  simState->targetSpeed = 255;
+  simState->currentSpeed = 0;
+  simState->powerConsumption = 0;
 }
+
+// button input ---------------------------------------------------------------
 
 void handleInput(){
   for(int i = 0; i<4 ; i++){
@@ -272,12 +374,25 @@ void handleInput(){
   }
 }
 
-void setLEDs(CRGB color){
-    for (uint8_t i = 0; i < 4; i++) {
-      leds[i] = color;
-    }
-    FastLED.show();
+void executeAction(menu_action_t action){
+  if(action == ACTION_GO_NOW){
+      timestamp = millis();
+      simState->state = STATE_RUNNING;
+  }
+  if(action == ACTION_GO_WHENREADY)
+    simState->state = STATE_READY;
+  if(action == ACTION_SET_PROG){
+    simState->prog = (machine_program_t) currentMenu->options[selectedMenu]->value;
+  }
+  if(action == ACTION_SET_TEMP){
+    simState->targetTemp = currentMenu->options[selectedMenu]->value;
+  }
+  if(action == ACTION_SET_SPEED){
+    simState->targetSpeed = currentMenu->options[selectedMenu]->value;
+  }
 }
+
+// output display -------------------------------------------------------------
 
 void drawFrame(){
   display.clearDisplay();
@@ -382,21 +497,16 @@ void paintInfoScreen(){
   display.setCursor(0, 24);
   display.setTextSize(1);
   display.println(bottom);
-
 }
 
-void initSimulationState(){
-  simState = (machine_simstate_t*) malloc(sizeof(machine_simstate_t));
-
-  simState->state = STATE_STOPPED;
-  simState->prog = M_PROGRAM_COTTON;
-  simState->step = M_STEP_IDLE;
-  simState->targetTemp = 90;
-  simState->currentTemp = 0;
-  simState->targetSpeed = 255;
-  simState->currentSpeed = 0;
-  simState->powerConsumption = 0;
+void setLEDs(CRGB color){
+    for (uint8_t i = 0; i < 4; i++) {
+      leds[i] = color;
+    }
+    FastLED.show();
 }
+
+// menu -----------------------------------------------------------------------
 
 void createMenu(){
 
