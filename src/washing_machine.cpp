@@ -13,11 +13,19 @@
 #define BTN3_PIN 7
 #define MOTOR_PIN 10
 
+#define TIMESCALE 40.0
+// ms
 #define SIM_STEP_TIME 200
-#define PROG_TIME_SPIN 20000
-#define PROG_TIME_WOOL 30000
-#define PROG_TIME_COTTON 60000
-#define PROG_TIME_SILK 10000
+// sec real time
+#define PROG_TIME_SPIN 1000
+#define PROG_TIME_WOOL 1500
+#define PROG_TIME_COTTON 3000
+#define PROG_TIME_SILK 1000
+
+#define POWER_HEAT 1500
+#define POWER_MOTOR 500
+
+#define AMBIENT_TEMP 18
 
 #define SERIAL_TIMEOUT 1000
 
@@ -53,10 +61,8 @@ struct menu_node_t {
   menu_action_t action;
   //type LIST & INFO
   menu_node_t** children;
-  //type CHOOSER
+  //type CHOOSER & ACTION
   menu_option_node_t** options;
-  //type ACTION
-  menu_action_node_t** actions;
 };
 
 menu_node_t* homeMenu;
@@ -69,13 +75,14 @@ enum machine_step_t { M_STEP_IDLE = 0x01, M_STEP_HEAT = 0x02, M_STEP_WASH = 0x03
 enum machine_state_t { STATE_STOPPED = 0x01, STATE_READY = 0x02, STATE_PAUSED = 0x03, STATE_RUNNING = 0x04 };
 
 struct machine_simstate_t {
+  menu_node_t* progChooser;
+  menu_node_t* tempChooser;
+  menu_node_t* speedChooser;
   machine_state_t state;
-  machine_program_t prog;
   machine_step_t step;
-  uint8_t targetTemp;
-  uint8_t currentTemp;
-  uint8_t targetSpeed;
-  uint8_t currentSpeed;
+  uint8_t heaterOn;
+  double currentTemp;
+  double currentSpeed;
   uint16_t powerConsumption;
 };
 
@@ -105,6 +112,7 @@ void sendMessage(uint8_t method, uint8_t code, uint16_t payload);
 // simulation
 void handleSimulation();
 void initSimulationState();
+uint32_t secSince(uint32_t timestamp);
 // button input
 void handleInput();
 void executeAction(menu_action_t action);
@@ -114,7 +122,10 @@ void paintInfoScreen();
 void setLEDs(CRGB color);
 // menu
 void createMenu();
+menu_option_node_t* newMenuOption(const char* label, uint16_t value);
 menu_node_t* newMenuEntry(menu_type_t type, const char* label);
+uint16_t getChoosenValue(menu_node_t* chooser);
+uint16_t setChoosen(menu_node_t* chooser, uint16_t value);
 
 
 void setup() {
@@ -131,7 +142,7 @@ void setup() {
     display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
     Serial.begin(9600);
-    while (!Serial) ;
+    //while (!Serial) ;
 
     ledColor = CRGB::Black;
     for (uint8_t i = 0; i < 4; i++) {
@@ -170,17 +181,14 @@ void handleSerial(){
   switch (method) {
     case METHOD_GET:
       switch (code) {
-        case S_FAIL:
-          // TODO
-          break;
         case S_PROGRAM:
-          sendMessage(METHOD_RESPONSE, S_PROGRAM, simState->prog);
+          sendMessage(METHOD_RESPONSE, S_PROGRAM, getChoosenValue(simState->progChooser));
           break;
         case S_TEMP:
-          sendMessage(METHOD_RESPONSE, S_TEMP, simState->targetTemp);
+          sendMessage(METHOD_RESPONSE, S_TEMP, getChoosenValue(simState->tempChooser));
           break;
         case S_SPEED:
-          sendMessage(METHOD_RESPONSE, S_SPEED, simState->targetSpeed);
+          sendMessage(METHOD_RESPONSE, S_SPEED, getChoosenValue(simState->speedChooser));
           break;
         case S_STATE:
           sendMessage(METHOD_RESPONSE, S_STATE, simState->state);
@@ -193,6 +201,26 @@ void handleSerial(){
           break;
         case S_CTEMP:
           sendMessage(METHOD_RESPONSE, S_CTEMP, simState->currentTemp);
+          break;
+        default:
+          // TODO some error
+          break;
+      }
+      break;
+    case METHOD_POST:
+      switch (code) {
+        case S_PROGRAM:
+          sendMessage(METHOD_RESPONSE, S_PROGRAM, setChoosen(simState->progChooser, payload));
+          break;
+        case S_TEMP:
+          sendMessage(METHOD_RESPONSE, S_TEMP, setChoosen(simState->tempChooser, payload));
+          break;
+        case S_SPEED:
+          sendMessage(METHOD_RESPONSE, S_SPEED, setChoosen(simState->speedChooser, payload));
+          break;
+        case S_STATE:
+          simState->state = (machine_state_t) payload;
+          sendMessage(METHOD_RESPONSE, S_STATE, simState->state);
           break;
         default:
           // TODO some error
@@ -242,39 +270,45 @@ void handleSimulation(){
   if(millis()-lastSim > SIM_STEP_TIME){
     lastSim = millis();
 
-    simState->powerConsumption = 1;
+    simState->powerConsumption = 10;
 
     machine_state_t state = simState->state;
     machine_step_t step = simState->step;
+    machine_program_t prog = (machine_program_t) getChoosenValue(simState->progChooser);
+    uint16_t targetTemp = getChoosenValue(simState->tempChooser);
+    uint16_t targetSpeed = getChoosenValue(simState->speedChooser);
 
     // state machine (steps)
     if(state == STATE_RUNNING){
 
       uint16_t progTime = 0;
-      if(simState->prog == M_PROGRAM_COTTON) progTime = PROG_TIME_COTTON;
-      else if(simState->prog == M_PROGRAM_WOOL) progTime = PROG_TIME_WOOL;
-      else if(simState->prog == M_PROGRAM_SILK) progTime = PROG_TIME_SILK;
-      else if(simState->prog == M_PROGRAM_SPIN) progTime = PROG_TIME_SILK;
+      if(prog == M_PROGRAM_COTTON) progTime = PROG_TIME_COTTON;
+      else if(prog == M_PROGRAM_WOOL) progTime = PROG_TIME_WOOL;
+      else if(prog == M_PROGRAM_SILK) progTime = PROG_TIME_SILK;
+      else if(prog == M_PROGRAM_SPIN) progTime = PROG_TIME_SPIN;
+
+      currentMenu = homeMenu;
+
 
       if (step == M_STEP_IDLE) {
         timestamp = millis();
-        if(simState->prog == M_PROGRAM_SPIN)  simState->step = M_STEP_SPIN;
-        else                                  simState->step = M_STEP_HEAT;
+        if(prog == M_PROGRAM_SPIN)  simState->step = M_STEP_SPIN;
+        else                        simState->step = M_STEP_HEAT;
 
       } else if (step == M_STEP_HEAT) {
-        if (simState->currentTemp >= simState->targetTemp) {
+        if (simState->currentTemp >= targetTemp) {
           simState->step = M_STEP_WASH;
           timestamp = millis();
         }
 
       } else if (step == M_STEP_WASH) {
-        if (millis()-timestamp > progTime){
+        if (secSince(timestamp) > progTime){
           simState->step = M_STEP_SPIN;
           timestamp = millis();
         }
 
       } else if (step == M_STEP_SPIN) {
-        if (millis()-timestamp > progTime){
+        if (secSince(timestamp) > PROG_TIME_SPIN){
           simState->step = M_STEP_IDLE;
           simState->state = STATE_STOPPED;
         }
@@ -287,40 +321,67 @@ void handleSimulation(){
     state = simState->state;
     step = simState->step;
 
-    // temp
-    if (simState->currentTemp <= simState->targetTemp && (step == M_STEP_HEAT || step == M_STEP_WASH)) {
-      simState->currentTemp += 3;
-    }else if(simState->currentTemp > 15){
-      simState->currentTemp--;
-    }else if(simState->currentTemp < 15){
-        simState->currentTemp++;
+    // simulate temperature
+    // ambient cooling/heating
+    simState->currentTemp -= (simState->currentTemp - AMBIENT_TEMP) * 0.00007 * TIMESCALE;
+
+    // heater
+    if(simState->heaterOn != 0){
+      simState->currentTemp += 0.04 * TIMESCALE;
+      simState->powerConsumption += POWER_HEAT;
     }
 
-    // Motor TODO
-    if (step == M_STEP_WASH) {
-      analogWrite(MOTOR_PIN, 128);
-    }else if (step == M_STEP_SPIN) {
-      analogWrite(MOTOR_PIN, simState->targetSpeed);
+    // two point temp regulation
+    if((step == M_STEP_HEAT || step == M_STEP_WASH) && state == STATE_RUNNING){
+      if (simState->currentTemp <= 0.95*targetTemp) {
+         simState->heaterOn = 1;
+      }else if (simState->currentTemp >= 1.05*targetTemp) {
+         simState->heaterOn = 0;
+      }
     }else{
-      analogWrite(MOTOR_PIN, 0);
+      simState->heaterOn = 0;
     }
+
+    //  Motor
+    if(state == STATE_RUNNING){
+        if (step == M_STEP_SPIN){
+            simState->currentSpeed = targetSpeed;
+        }else if ((step == M_STEP_WASH || M_STEP_HEAT) && secSince(timestamp)%(int)(4*TIMESCALE)>TIMESCALE) {
+          simState->currentSpeed = 128;
+        }else{
+          simState->currentSpeed = 0;
+        }
+    }else{
+        simState->currentSpeed = 0;
+    }
+
+    simState->powerConsumption += (simState->currentSpeed*POWER_MOTOR)/255;
+
+    analogWrite(MOTOR_PIN, simState->currentSpeed);
 
     // leds
-    setLEDs(CHSV((180-2*simState->currentTemp)%256,255,255));
+    setLEDs(CHSV((int)(180-2*simState->currentTemp)%256,255,255));
+
+    Serial.println(String(simState->powerConsumption/10) + " " + String(simState->currentTemp));
   }
 }
 
 void initSimulationState(){
   simState = (machine_simstate_t*) malloc(sizeof(machine_simstate_t));
 
+  simState->progChooser = nullptr;
+  simState->tempChooser = nullptr;
+  simState->speedChooser = nullptr;
   simState->state = STATE_STOPPED;
-  simState->prog = M_PROGRAM_COTTON;
   simState->step = M_STEP_IDLE;
-  simState->targetTemp = 90;
+  simState->heaterOn = 0;
   simState->currentTemp = 0;
-  simState->targetSpeed = 255;
   simState->currentSpeed = 0;
   simState->powerConsumption = 0;
+}
+
+uint32_t secSince(uint32_t timestamp){
+  return TIMESCALE*(millis()-timestamp) / (1000);
 }
 
 // button input ---------------------------------------------------------------
@@ -359,10 +420,9 @@ void handleInput(){
               }else if (t == MENU_LIST){
                 currentMenu = currentMenu->children[selectedMenu];
               }else if (t == MENU_CHOOSER){
-                executeAction(currentMenu->action);
                 currentMenu = currentMenu->parent;
               }else if (t == MENU_ACTION){
-                executeAction(currentMenu->actions[selectedMenu]->action);
+                executeAction((menu_action_t)currentMenu->options[selectedMenu]->value);
                 currentMenu->choosen = 0;
                 currentMenu = homeMenu;
               }
@@ -381,15 +441,6 @@ void executeAction(menu_action_t action){
   }
   if(action == ACTION_GO_WHENREADY)
     simState->state = STATE_READY;
-  if(action == ACTION_SET_PROG){
-    simState->prog = (machine_program_t) currentMenu->options[selectedMenu]->value;
-  }
-  if(action == ACTION_SET_TEMP){
-    simState->targetTemp = currentMenu->options[selectedMenu]->value;
-  }
-  if(action == ACTION_SET_SPEED){
-    simState->targetSpeed = currentMenu->options[selectedMenu]->value;
-  }
 }
 
 // output display -------------------------------------------------------------
@@ -433,7 +484,7 @@ void drawFrame(){
     case MENU_ACTION:
       display.setTextSize(1);
       for(int i=0; i<currentMenu->numElements; i++){
-        menu_action_node_t* c = currentMenu->actions[i];
+        menu_option_node_t* c = currentMenu->options[i];
         line = "";
         if(i==selectedMenu) line += ">";
         else line += " ";
@@ -485,7 +536,7 @@ void paintInfoScreen(){
   }
 
   if(simState->state == STATE_RUNNING){
-    bottom += String(millis() - timestamp);
+    bottom += String(secSince(timestamp));
   }
 
   display.setCursor(0, 0);
@@ -529,9 +580,7 @@ void createMenu(){
     menu_node_t* startScreen  = newMenuEntry(MENU_ACTION,"Start");
 
     // options
-    menu_option_node_t* progCotton = (menu_option_node_t*) malloc(sizeof(menu_option_node_t));
-    progCotton->value = M_PROGRAM_COTTON;
-    strcpy(progCotton->label, "Cotton");
+    menu_option_node_t* progCotton = newMenuOption("Cotton", M_PROGRAM_COTTON);
     menu_option_node_t* progWool = (menu_option_node_t*) malloc(sizeof(menu_option_node_t));
     progWool->value = M_PROGRAM_WOOL;
     strcpy(progWool->label, "Wool");
@@ -563,12 +612,8 @@ void createMenu(){
     strcpy(speed0->label, "off");
 
     //actions
-    menu_action_node_t* goNow = (menu_action_node_t*) malloc(sizeof(menu_action_node_t));
-    goNow->action = ACTION_GO_NOW;
-    strcpy(goNow->label, "start now");
-    menu_action_node_t* goReady = (menu_action_node_t*) malloc(sizeof(menu_action_node_t));
-    goReady->action = ACTION_GO_WHENREADY;
-    strcpy(goReady->label, "autostart");
+    menu_option_node_t* goNow   = newMenuOption("start now", ACTION_GO_NOW);
+    menu_option_node_t* goReady = newMenuOption("autostart", ACTION_GO_WHENREADY);
 
     // structure
     infoScreen->parent = nullptr;
@@ -611,13 +656,25 @@ void createMenu(){
 
     startScreen->parent = configScreen;
     startScreen->numElements = 2;
-    startScreen->actions = (menu_action_node_t**) malloc(2*sizeof(menu_action_node_t*));
-    startScreen->actions[0] = goNow;
-    startScreen->actions[1] = goReady;
+    startScreen->options = (menu_option_node_t**) malloc(2*sizeof(menu_option_node_t*));
+    startScreen->options[0] = goNow;
+    startScreen->options[1] = goReady;
 
     selectedMenu = 0;
     homeMenu = infoScreen;
     currentMenu = infoScreen;
+
+    simState->progChooser = progChooser;
+    simState->tempChooser = tempChooser;
+    simState->speedChooser = speedChooser;
+  }
+
+
+  menu_option_node_t* newMenuOption(const char* label, uint16_t value){
+    menu_option_node_t* node = (menu_option_node_t*) malloc(sizeof(menu_option_node_t));
+    node->value = value;
+    strcpy(node->label, label);
+    return node;
   }
 
   menu_node_t* newMenuEntry(menu_type_t type, const char* label){
@@ -631,7 +688,26 @@ void createMenu(){
       node->action = ACTION_NONE;
       node->children = nullptr;
       node->options = nullptr;
-      node->actions = nullptr;
 
       return node;
+  }
+
+  uint16_t getChoosenValue(menu_node_t* chooser){
+    if(chooser == nullptr || chooser->type != MENU_CHOOSER || chooser->choosen > chooser->numElements) return 0;
+    uint8_t i = chooser->choosen;
+    return chooser->options[i]->value;
+  }
+
+  uint16_t setChoosen(menu_node_t* chooser, uint16_t value){
+        int c = chooser->choosen;
+
+        for(int i=0; i<chooser->numElements; i++){
+          if (chooser->options[i]->value == value){
+            c = i;
+            break;
+          }
+        }
+        chooser->choosen = c;
+
+        return chooser->options[c]->value;
   }
