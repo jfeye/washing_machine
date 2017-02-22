@@ -8,8 +8,8 @@
 #define NUM_LEDS 4
 #define LED_PIN 9
 #define BTN0_PIN 4
-#define BTN1_PIN 5
-#define BTN2_PIN 6
+#define BTN1_PIN 6
+#define BTN2_PIN 5
 #define BTN3_PIN 7
 #define MOTOR_PIN 10
 
@@ -87,6 +87,7 @@ struct machine_simstate_t {
 };
 
 machine_simstate_t* simState;
+machine_simstate_t* lastSimState;
 uint32_t lastSim = 0;
 uint32_t timestamp = 0;
 
@@ -111,6 +112,7 @@ uint8_t receiveBytes(uint8_t bytes);
 void sendMessage(uint8_t method, uint8_t code, uint16_t payload);
 // simulation
 void handleSimulation();
+void checkUpdatedRessources();
 void initSimulationState();
 uint32_t secSince(uint32_t timestamp);
 // button input
@@ -362,7 +364,26 @@ void handleSimulation(){
     // leds
     setLEDs(CHSV((int)(180-2*simState->currentTemp)%256,255,255));
 
-    Serial.println(String(simState->powerConsumption/10) + " " + String(simState->currentTemp));
+    checkUpdatedRessources();
+  }
+}
+
+void checkUpdatedRessources(){
+  if(simState->state != lastSimState->state){
+    lastSimState->state = simState->state;
+    sendMessage(METHOD_POST, S_STATE, simState->state);
+  }
+  if(simState->step != lastSimState->step){
+    lastSimState->step = simState->step;
+    sendMessage(METHOD_POST, S_STEP, simState->step);
+  }
+  if((int)simState->currentTemp != (int)lastSimState->currentTemp){
+    lastSimState->currentTemp = simState->currentTemp;
+    sendMessage(METHOD_POST, S_CTEMP, (int)simState->currentTemp);
+  }
+  if(simState->powerConsumption != lastSimState->powerConsumption){
+    lastSimState->powerConsumption = simState->powerConsumption;
+    sendMessage(METHOD_POST, S_POWER, simState->powerConsumption);
   }
 }
 
@@ -378,6 +399,18 @@ void initSimulationState(){
   simState->currentTemp = 0;
   simState->currentSpeed = 0;
   simState->powerConsumption = 0;
+
+  lastSimState = (machine_simstate_t*) malloc(sizeof(machine_simstate_t));
+
+  lastSimState->progChooser = nullptr;
+  lastSimState->tempChooser = nullptr;
+  lastSimState->speedChooser = nullptr;
+  lastSimState->state = STATE_STOPPED;
+  lastSimState->step = M_STEP_IDLE;
+  lastSimState->heaterOn = 0;
+  lastSimState->currentTemp = 0;
+  lastSimState->currentSpeed = 0;
+  lastSimState->powerConsumption = 0;
 }
 
 uint32_t secSince(uint32_t timestamp){
@@ -420,6 +453,7 @@ void handleInput(){
               }else if (t == MENU_LIST){
                 currentMenu = currentMenu->children[selectedMenu];
               }else if (t == MENU_CHOOSER){
+                executeAction(currentMenu->action);
                 currentMenu = currentMenu->parent;
               }else if (t == MENU_ACTION){
                 executeAction((menu_action_t)currentMenu->options[selectedMenu]->value);
@@ -438,9 +472,20 @@ void executeAction(menu_action_t action){
   if(action == ACTION_GO_NOW){
       timestamp = millis();
       simState->state = STATE_RUNNING;
-  }
-  if(action == ACTION_GO_WHENREADY)
+
+  }else if(action == ACTION_GO_WHENREADY){
     simState->state = STATE_READY;
+
+  }else if(action == ACTION_SET_PROG){
+    sendMessage(METHOD_POST, S_PROGRAM, getChoosenValue(simState->progChooser));
+
+  }else if(action == ACTION_SET_TEMP){
+    sendMessage(METHOD_POST, S_TEMP, getChoosenValue(simState->tempChooser));
+
+  }else if(action == ACTION_SET_SPEED){
+    sendMessage(METHOD_POST, S_SPEED, getChoosenValue(simState->speedChooser));
+
+  }
 }
 
 // output display -------------------------------------------------------------
@@ -667,6 +712,10 @@ void createMenu(){
     simState->progChooser = progChooser;
     simState->tempChooser = tempChooser;
     simState->speedChooser = speedChooser;
+
+    lastSimState->progChooser = progChooser;
+    lastSimState->tempChooser = tempChooser;
+    lastSimState->speedChooser = speedChooser;
   }
 
 
